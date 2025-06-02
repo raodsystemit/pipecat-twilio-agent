@@ -10,7 +10,7 @@ import os
 import sys
 import wave
 
-import aiofiles
+import aiofiles # Asegúrate de que aiofiles esté instalado si no lo estaba ya
 from dotenv import load_dotenv
 from fastapi import WebSocket
 from loguru import logger
@@ -21,10 +21,14 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
+# Descomenta la siguiente línea si necesitas el ResamplerProcessor
+# from pipecat.processors.audio.resampler import ResamplerProcessor
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.openai.llm import OpenAILLMService
+# Ya no necesitamos ElevenLabsTTSService ni WhisperSTTService ni OpenAILLMService
+from pipecat.services.gemini_multimodal_live.gemini import (
+    GeminiMultimodalLiveLLMService,
+    InputParams,
+)
 from pipecat.transports.network.fastapi_websocket import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -43,7 +47,7 @@ async def save_audio(server_name: str, audio: bytes, sample_rate: int, num_chann
         )
         with io.BytesIO() as buffer:
             with wave.open(buffer, "wb") as wf:
-                wf.setsampwidth(2)
+                wf.setsampwidth(2) # Asumiendo 16-bit audio
                 wf.setnchannels(num_channels)
                 wf.setframerate(sample_rate)
                 wf.writeframes(audio)
@@ -54,72 +58,87 @@ async def save_audio(server_name: str, audio: bytes, sample_rate: int, num_chann
         logger.info("No audio data to save")
 
 
-async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool):
+async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool): # call_sid no se usa aquí, lo quité si no es necesario para TwilioFrameSerializer
     transport = FastAPIWebsocketTransport(
         websocket=websocket_client,
         params=FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            add_wav_header=False,
+            add_wav_header=False, # Gemini probablemente no quiere encabezados WAV en el stream
             vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
-            vad_audio_passthrough=True,
-            serializer=TwilioFrameSerializer(stream_sid),
+            vad_analyzer=SileroVADAnalyzer(), # Gemini también tiene VAD, pero esto puede ayudar a controlar el flujo de frames inicial
+            vad_audio_passthrough=True, # Asegura que el audio llegue a Gemini
+            serializer=TwilioFrameSerializer(stream_sid=stream_sid), # stream_sid es necesario aquí
         ),
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
-
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"), audio_passthrough=True)
-
-    tts = ElevenLabsTTSService(
-            api_key=os.getenv("ELEVEN_API_KEY"),
-            voice_id=os.getenv("ELEVEN_VOICE_ID"),
+    # Inicializar el servicio Gemini Multimodal Live
+    # Asegúrate de tener GEMINI_API_KEY en tu .env
+    llm_gemini = GeminiMultimodalLiveLLMService(
+        api_key=os.getenv("GEMINI_API_KEY"),
+        voice_id="Puck",  # Puedes elegir otras voces: Aoede, Charon, Fenrir, Kore
+        transcribe_user_audio=True, # Gemini se encargará del STT
+        params=InputParams(temperature=0.7)
     )
 
+    # Mensajes del sistema en ESPAÑOL y adaptados para Gemini (usa "user" para el prompt inicial)
+    # El prompt que tenías en el ejemplo de Gemini para RAOD System:
     messages = [
         {
-            "role": "system",
-            "content": "You are a helpful assistant named Tasha. Your output will be converted to audio so don't include special characters in your answers. Respond with a short short sentence.",
+            "role": "user", # Gemini usa "user" para el system prompt inicial
+            "content": "Eres un agente de IA que pertenece a RAOD System, debes presentarte de tal manera, tienes toda la información referente a la empresa. Habla siempre en español.",
         },
+        # O tu prompt anterior adaptado:
+        # {
+        #     "role": "user",
+        #     "content": "Eres Tasha, una asistente de IA muy servicial. Tus respuestas se convertirán a audio, así que no incluyas caracteres especiales. Responde con frases cortas y siempre en español.",
+        # },
     ]
 
     context = OpenAILLMContext(messages)
-    context_aggregator = llm.create_context_aggregator(context)
+    # Gemini service crea su propio context aggregator compatible
+    context_aggregator = llm_gemini.create_context_aggregator(context)
 
-    # NOTE: Watch out! This will save all the conversation in memory. You can
-    # pass `buffer_size` to get periodic callbacks.
     audiobuffer = AudioBufferProcessor(user_continuous_stream=not testing)
 
-    pipeline = Pipeline(
-        [
-            transport.input(),  # Websocket input from client
-            stt,  # Speech-To-Text
-            context_aggregator.user(),
-            llm,  # LLM
-            tts,  # Text-To-Speech
-            transport.output(),  # Websocket output to client
-            audiobuffer,  # Used to buffer the audio in the pipeline
-            context_aggregator.assistant(),
-        ]
-    )
+    pipeline_processors = [
+        transport.input(),          # Entrada de audio desde Twilio/Websocket
+        context_aggregator.user(),  # Agrega el contexto del usuario (basado en STT interno de Gemini)
+        llm_gemini,                 # Procesa con Gemini (STT interno, LLM, TTS interno)
+        context_aggregator.assistant(), # Agrega el contexto del asistente (respuesta de Gemini)
+    ]
+
+    # IMPORTANTE: Considerar re-muestreo para Twilio si es necesario
+    # Gemini produce audio a 24kHz. Twilio usualmente espera 8kHz.
+    # Si tienes problemas con el audio en Twilio, descomenta las siguientes líneas
+    # e instala el procesador si es necesario (`pip install pipecat-ai[processors]`).
+    # from pipecat.processors.audio.resampler import ResamplerProcessor
+    # pipeline_processors.append(ResamplerProcessor(target_sample_rate=8000))
+
+    pipeline_processors.extend([
+        transport.output(),         # Salida de audio a Twilio/Websocket
+        audiobuffer,                # Buffer para grabar (opcional)
+    ])
+
+    pipeline = Pipeline(pipeline_processors)
 
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
+            audio_in_sample_rate=16000,  # Gemini espera 16kHz
+            audio_out_sample_rate=24000, # Gemini produce 24kHz. (Ver nota sobre re-muestreo para Twilio)
             allow_interruptions=True,
         ),
     )
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        # Start recording.
         await audiobuffer.start_recording()
-        # Kick off the conversation.
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
+        # Mensaje de inicio en ESPAÑOL (Gemini usa 'user' para este tipo de interacciones)
+        # messages.append({"role": "user", "content": "Por favor, preséntate al usuario. Recuerda tu nombre y que hablas en español."})
+        # O simplemente deja que el system prompt inicial guíe la primera interacción:
         await task.queue_frames([context_aggregator.user().get_context_frame()])
+
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
@@ -127,13 +146,10 @@ async def run_bot(websocket_client: WebSocket, stream_sid: str, testing: bool):
 
     @audiobuffer.event_handler("on_audio_data")
     async def on_audio_data(buffer, audio, sample_rate, num_channels):
-        server_name = f"server_{websocket_client.client.port}"
+        # server_name podría necesitar ser definido de otra manera si websocket_client.client.port no está disponible
+        # podrías usar el stream_sid o una parte de él.
+        server_name = f"server_twilio_{stream_sid}"
         await save_audio(server_name, audio, sample_rate, num_channels)
 
-    # We use `handle_sigint=False` because `uvicorn` is controlling keyboard
-    # interruptions. We use `force_gc=True` to force garbage collection after
-    # the runner finishes running a task which could be useful for long running
-    # applications with multiple clients connecting.
     runner = PipelineRunner(handle_sigint=False, force_gc=True)
-
     await runner.run(task)

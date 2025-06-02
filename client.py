@@ -19,18 +19,21 @@ import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
+# --- PIPECAT IMPORTS ---
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import EndFrame, TransportMessageUrgentFrame
+from pipecat.frames.frames import EndFrame, TransportMessageUrgentFrame, StartFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
+# from pipecat.processors.audio.resampler import ResamplerProcessor # Asegúrate de que esté importado
 from pipecat.serializers.twilio import TwilioFrameSerializer
-from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.gemini_multimodal_live.gemini import (
+    GeminiMultimodalLiveLLMService,
+    InputParams,
+)
 from pipecat.transports.network.websocket_client import (
     WebsocketClientParams,
     WebsocketClientTransport,
@@ -38,25 +41,35 @@ from pipecat.transports.network.websocket_client import (
 
 load_dotenv(override=True)
 
+# Configuración del logger
 logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+logger.add(sys.stderr, level="DEBUG") # Nivel DEBUG para ver todos los logs
 
 
 DEFAULT_CLIENT_DURATION = 30
 
 
-async def download_twiml(server_url: str) -> str:
-    # TODO(aleix): add error checking.
+async def download_twiml(server_url: str, client_name: str) -> str:
+    logger.debug(f"[{client_name}] Attempting to download TwiML from: {server_url}")
     async with aiohttp.ClientSession() as session:
         async with session.post(server_url) as response:
-            return await response.text()
+            logger.debug(f"[{client_name}] TwiML request status: {response.status}")
+            response.raise_for_status()
+            twiml = await response.text()
+            logger.debug(f"[{client_name}] Received TwiML (first 100 chars): {twiml[:100]}...")
+            return twiml
 
 
-def get_stream_url_from_twiml(twiml: str) -> str:
+def get_stream_url_from_twiml(twiml: str, client_name: str) -> str:
+    logger.debug(f"[{client_name}] Parsing TwiML to find stream URL...")
     root = ET.fromstring(twiml)
-    # TODO(aleix): add error checking.
-    stream_element = root.find(".//Stream")  # Finds the first <Stream> element
+    stream_element = root.find(".//Stream")
+    if stream_element is None or stream_element.get("url") is None:
+        error_msg = f"Could not find Stream URL in TwiML: {twiml}"
+        logger.error(f"[{client_name}] {error_msg}")
+        raise ValueError(error_msg)
     url = stream_element.get("url")
+    logger.info(f"[{client_name}] Extracted WebSocket Stream URL: {url}")
     return url
 
 
@@ -73,18 +86,24 @@ async def save_audio(client_name: str, audio: bytes, sample_rate: int, num_chann
                 wf.writeframes(audio)
             async with aiofiles.open(filename, "wb") as file:
                 await file.write(buffer.getvalue())
-        logger.info(f"Merged audio saved to {filename}")
+        logger.info(f"[{client_name}] Merged audio saved to {filename}")
     else:
-        logger.info("No audio data to save")
+        logger.debug(f"[{client_name}] No audio data to save (empty audio frame).")
 
 
 async def run_client(client_name: str, server_url: str, duration_secs: int):
-    twiml = await download_twiml(server_url)
-
-    stream_url = get_stream_url_from_twiml(twiml)
+    logger.info(f"[{client_name}] Starting client to connect to {server_url} for {duration_secs}s")
+    try:
+        twiml = await download_twiml(server_url, client_name)
+        stream_url = get_stream_url_from_twiml(twiml, client_name)
+    except Exception as e:
+        logger.error(f"[{client_name}] Failed to get TwiML or stream URL: {e}. Aborting client.")
+        return
 
     stream_sid = str(uuid4())
+    logger.debug(f"[{client_name}] Generated Stream SID: {stream_sid}")
 
+    logger.debug(f"[{client_name}] Initializing WebsocketClientTransport to {stream_url}")
     transport = WebsocketClientTransport(
         uri=stream_url,
         params=WebsocketClientParams(
@@ -92,96 +111,142 @@ async def run_client(client_name: str, server_url: str, duration_secs: int):
             audio_out_enabled=True,
             add_wav_header=False,
             serializer=TwilioFrameSerializer(stream_sid),
-            vad_enabled=True,
+            # Parámetros VAD actualizados (quitar vad_enabled y vad_audio_passthrough si tu versión de Pipecat lo soporta)
             vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=1.5)),
-            vad_audio_passthrough=True,
         ),
     )
+    logger.debug(f"[{client_name}] WebsocketClientTransport initialized.")
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+    # --- SELECCIONA LA PIPELINE A PROBAR ---
 
-    # We let the audio passthrough so we can record the conversation.
-    stt = DeepgramSTTService(
-        api_key=os.getenv("DEEPGRAM_API_KEY"),
-        audio_passthrough=True,
-    )
+    # --- OPCIÓN 1: PIPELINE SIMPLIFICADA (para depurar AttributeError) ---
+    USE_SIMPLIFIED_PIPELINE = True # CAMBIA A False PARA USAR LA PIPELINE COMPLETA
+    # --- FIN OPCIÓN 1 ---
 
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="e13cae5c-ec59-4f71-b0a6-266df3c9bb8e",  # Madame Mischief
-        push_silence_after_stop=True,
-    )
-
-    messages = [
-        {
-            "role": "system",
-            "content": "You are an 8 year old child. A teacher will explain you new concepts you want to know about. Feel free to change topics whnever you want. Once you are taught something you need to keep asking for clarifications if you think someone your age would not understand what you are being taught.",
-        },
-    ]
-
-    context = OpenAILLMContext(messages)
-    context_aggregator = llm.create_context_aggregator(context)
-
-    # NOTE: Watch out! This will save all the conversation in memory. You can
-    # pass `buffer_size` to get periodic callbacks.
-    audiobuffer = AudioBufferProcessor(user_continuous_stream=False)
-
-    pipeline = Pipeline(
-        [
-            transport.input(),  # Websocket input from server
-            stt,  # Speech-To-Text
-            context_aggregator.user(),
-            llm,  # LLM
-            tts,  # Text-To-Speech
-            transport.output(),  # Websocket output to server
-            audiobuffer,  # Used to buffer the audio in the pipeline
-            context_aggregator.assistant(),
+    if USE_SIMPLIFIED_PIPELINE:
+        logger.info(f"[{client_name}] Using SIMPLIFIED pipeline.")
+        pipeline_processors = [
+            transport.input(),
+            transport.output(),
         ]
-    )
-
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
+        active_pipeline_params = PipelineParams(
+            audio_in_sample_rate=8000,  # TODO: Ajusta a lo que el bot realmente envía (Twilio suele ser 8k)
+            audio_out_sample_rate=8000, # Debe coincidir con _in si no hay procesamiento intermedio
             allow_interruptions=True,
-        ),
-    )
+        )
+    else:
+        logger.info(f"[{client_name}] Using FULL Gemini pipeline.")
+        # Gemini Multimodal Live para el CLIENTE
+        llm_client_gemini = GeminiMultimodalLiveLLMService(
+            api_key=os.getenv("GEMINI_API_KEY"),
+            voice_id="Puck",
+            transcribe_user_audio=True,
+            params=InputParams(temperature=0.9)
+        )
+        messages = [{
+            "role": "user",
+            "content": "Eres un niño o niña de 8 años llamado Alex. Eres curioso y un poco travieso. Un profesor o profesora te explicará conceptos nuevos. Haz preguntas como lo haría un niño de tu edad. Habla siempre en español.",
+        }]
+        context = OpenAILLMContext(messages)
+        context_aggregator = llm_client_gemini.create_context_aggregator(context)
+        audiobuffer = AudioBufferProcessor(user_continuous_stream=False)
 
+        pipeline_processors = [
+            transport.input(),
+            # TODO: Considera un ResamplerProcessor aquí si el audio del bot (servidor)
+            # no está a 16kHz, que es lo que Gemini prefiere en su entrada.
+            # ResamplerProcessor(target_sample_rate=16000),
+            transport.output(),
+            audiobuffer,
+        ]
+        active_pipeline_params = PipelineParams(
+            # TODO: Ajusta audio_in_sample_rate a lo que el bot realmente envía.
+            # Si añades un Resampler a 16k después del input, esta sería la tasa original del bot.
+            audio_in_sample_rate=16000,
+            audio_out_sample_rate=8000, # Después del Resampler de salida a 8kHz
+            allow_interruptions=True,
+        )
+
+    logger.debug(f"[{client_name}] Initializing Pipeline with {len(pipeline_processors)} processors...")
+    pipeline = Pipeline(pipeline_processors)
+    logger.debug(f"[{client_name}] Pipeline initialized.")
+
+    logger.debug(f"[{client_name}] Initializing PipelineTask with params: {active_pipeline_params}")
+    task = PipelineTask(pipeline, params=active_pipeline_params)
+    logger.debug(f"[{client_name}] PipelineTask initialized: {task.id if task else 'None'}")
+
+    # Event Handlers
     @transport.event_handler("on_connected")
-    async def on_connected(transport: WebsocketClientTransport, client):
-        # Start recording.
-        await audiobuffer.start_recording()
+    async def on_connected(transport_instance, client_websocket):
+        logger.info(f"[{client_name}] Event: Websocket connected! Session: {client_websocket}")
+        if not USE_SIMPLIFIED_PIPELINE and 'audiobuffer' in locals():
+            await audiobuffer.start_recording()
+            logger.debug(f"[{client_name}] AudioBuffer recording started (full pipeline).")
 
-        message = TransportMessageUrgentFrame(
+        logger.debug(f"[{client_name}] Sending Twilio 'connected' message.")
+        connected_message = TransportMessageUrgentFrame(
             message={"event": "connected", "protocol": "Call", "version": "1.0.0"}
         )
-        await transport.output().send_message(message)
+        await transport_instance.output().send_message(connected_message)
 
-        message = TransportMessageUrgentFrame(
+        logger.debug(f"[{client_name}] Sending Twilio 'start' message with Stream SID: {stream_sid}")
+        start_message = TransportMessageUrgentFrame(
             message={"event": "start", "streamSid": stream_sid, "start": {"streamSid": stream_sid}}
         )
-        await transport.output().send_message(message)
+        await transport_instance.output().send_message(start_message)
+        logger.info(f"[{client_name}] Twilio start messages sent.")
 
-    @audiobuffer.event_handler("on_audio_data")
-    async def on_audio_data(buffer, audio, sample_rate, num_channels):
-        await save_audio(client_name, audio, sample_rate, num_channels)
+        if not USE_SIMPLIFIED_PIPELINE and 'context_aggregator' in locals():
+            logger.debug(f"[{client_name}] Kicking off client's conversation context (full pipeline).")
+            # Esto es para que el LLM del cliente genere su primera frase si así está diseñado el prompt.
+            # await task.queue_frames([context_aggregator.user().get_context_frame()]) # Podría necesitar un StartFrame o un UserStartedSpeakingFrame
+            # Considera enviar un frame vacío o un evento específico para iniciar el LLM del cliente si es necesario
+            pass
 
-    async def end_call():
+
+    @transport.event_handler("on_error")
+    async def on_error(transport_instance, error_message):
+        logger.error(f"[{client_name}] Event: Websocket error! Message: {error_message}")
+
+    @transport.event_handler("on_disconnected")
+    async def on_disconnected(transport_instance, reason=None):
+        logger.warning(f"[{client_name}] Event: Websocket disconnected! Reason: {reason}")
+
+    if not USE_SIMPLIFIED_PIPELINE and 'audiobuffer' in locals():
+        @audiobuffer.event_handler("on_audio_data")
+        async def on_audio_data(buffer, audio, sample_rate, num_channels):
+            # Este audio es el que el cliente *envía* (su propia voz generada por Gemini y re-muestreada)
+            await save_audio(f"{client_name}_output", audio, sample_rate, num_channels)
+
+    async def end_call_after_duration():
+        logger.debug(f"[{client_name}] Call will end in {duration_secs} seconds.")
         await asyncio.sleep(duration_secs)
-        await task.queue_frame(EndFrame())
+        logger.info(f"[{client_name}] Duration ended. Sending EndFrame to task: {task.id if task else 'None'}")
+        if task and task.is_running: # Solo envía EndFrame si la tarea existe y está corriendo
+            await task.queue_frame(EndFrame())
+        else:
+            logger.warning(f"[{client_name}] Task not running or not initialized, cannot send EndFrame.")
+
 
     runner = PipelineRunner()
-
-    await asyncio.gather(runner.run(task), end_call())
+    logger.info(f"[{client_name}] Starting PipelineRunner for task: {task.id if task else 'None'}")
+    try:
+        # Ejecutar la pipeline y la finalización de la llamada concurrentemente
+        await asyncio.gather(runner.run(task), end_call_after_duration())
+    except Exception as e:
+        logger.error(f"[{client_name}] Critical error during pipeline execution or end_call: {e}", exc_info=True)
+        # Asegúrate de que la tarea se cancele si hay un error aquí
+        if task and task.is_running:
+            await task.cancel()
+            logger.info(f"[{client_name}] Task {task.id} cancelled due to critical error.")
+    finally:
+        logger.info(f"[{client_name}] Client run finished.")
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Pipecat Twilio Chatbot Client")
+    parser = argparse.ArgumentParser(description="Pipecat Twilio Chatbot Client con Logs")
     parser.add_argument("-u", "--url", type=str, required=True, help="specify the server URL")
-    parser.add_argument(
-        "-c", "--clients", type=int, required=True, help="number of concurrent clients"
-    )
+    parser.add_argument("-c", "--clients", type=int, default=1, help="number of concurrent clients")
     parser.add_argument(
         "-d",
         "--duration",
@@ -189,12 +254,23 @@ async def main():
         default=DEFAULT_CLIENT_DURATION,
         help=f"duration of each client in seconds (default: {DEFAULT_CLIENT_DURATION})",
     )
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args() # Usar parse_args() si no esperas argumentos desconocidos
 
-    clients = []
+    logger.info(f"Starting main function, preparing to launch {args.clients} client(s).")
+
+    client_tasks = []
     for i in range(args.clients):
-        clients.append(asyncio.create_task(run_client(f"client_{i}", args.url, args.duration)))
-    await asyncio.gather(*clients)
+        # Crear un nombre de cliente único para cada instancia
+        unique_client_name = f"client_{i}_{str(uuid4())[:8]}" # Más único que solo el índice
+        client_tasks.append(
+            asyncio.create_task(run_client(unique_client_name, args.url, args.duration))
+        )
+
+    try:
+        await asyncio.gather(*client_tasks)
+    except Exception as e:
+        logger.error(f"Error gathering client tasks: {e}", exc_info=True)
+    logger.info("All client tasks gathered.")
 
 
 if __name__ == "__main__":
